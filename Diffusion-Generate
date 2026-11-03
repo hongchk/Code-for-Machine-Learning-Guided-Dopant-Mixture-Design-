@@ -1,1 +1,584 @@
+import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+from collections import Counter
+from torch import nn
+from rdkit import Chem
+from rdkit.ML.Descriptors import MoleculeDescriptors
+from rdkit.Chem import Descriptors
+import joblib
+import multiprocessing
+from functools import partial
+from tqdm import tqdm  
+
+def RDkit_descriptors(smiles):
+    mols=[]
+    for i in smiles:
+        try:
+            Chem.MolFromSmiles(i)
+            mols.append(Chem.MolFromSmiles(i))
+        except:
+            print(i)
+            break
+    calc = MoleculeDescriptors.MolecularDescriptorCalculator([x[0] for x in Descriptors._descList])
+    desc_names = calc.GetDescriptorNames()
+    n=0
+    Mol_descriptors = []
+    for mol in mols:
+        # add hydrogens to molecules
+        n+=1
+        try:
+            mol = Chem.AddHs(mol)
+        except:
+            print(n)
+            exit()
+        # Calculate all 200 descriptors for each molecule
+        descriptors = calc.CalcDescriptors(mol)
+        Mol_descriptors.append(descriptors)
+    return Mol_descriptors, desc_names
+
+N_JOBS = 2
+data = pd.read_excel('mix-6code.xlsx')
+texts = data['code'].astype(str).tolist()
+
+all_chars_list = []
+for text in texts:
+    chars = text.split(', ')
+    all_chars_list.append(chars)
+
+all_chars = [char for list in all_chars_list for char in list]
+char_counter = Counter(all_chars)
+vocab = {char: idx + 1 for idx, (char, _) in enumerate(char_counter.items())}  # +1 to reserve 0 for padding
+vocab_size = len(vocab) + 1  # Add 1 for padding token
+BEAD_SMILES = pd.read_excel('mix-6code-group.xlsx').astype(str)
+inv_vocab = {idx: char for char, idx in vocab.items()}
+
+def text_to_sequence(text):
+    return [vocab[char] for char in text if char != ', ']
+
+sequences = []
+for text in texts:
+    chars = text.split(', ')
+    sequences.append(text_to_sequence(chars))
+    #print(text)
+
+# Pad sequences to have a uniform length
+max_len = max(len(seq) for seq in sequences)
+padded_sequences = [seq + [0] * (max_len - len(seq)) for seq in sequences]
+
+# Convert to PyTorch tensors
+tensor_sequences = torch.tensor(padded_sequences, dtype=torch.float)
+
+# Create Dataset and DataLoader
+class StringDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+
+dataset = StringDataset(tensor_sequences)
+dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+dataset = tensor_sequences.to(dtype=torch.float)
+
+num_steps = 2000
+
+
+betas = torch.linspace(-6, 6, num_steps)
+betas = torch.sigmoid(betas) * (0.5e-2 - 1e-5) + 1e-5
+
+
+alphas = 1 - betas
+alphas_prod = torch.cumprod(alphas, 0)
+alphas_prod_p = torch.cat([torch.tensor([1]).float(), alphas_prod[:-1]], 0) #p表示为previous
+alphas_bar_sqrt = torch.sqrt(alphas_prod)
+one_minus_alphas_bar_log = torch.log(1 - alphas_prod)
+one_minus_alphas_bar_sqrt = torch.sqrt(1 - alphas_prod)
+
+
+def q_x(x_0, t, betas):
+    alphas = 1 - betas
+    alphas_prod = torch.cumprod(alphas, 0)
+    alphas_prod_p = torch.cat([torch.tensor([1]).float(), alphas_prod[:-1]], 0)  # p表示为previous
+    alphas_bar_sqrt = torch.sqrt(alphas_prod)
+    one_minus_alphas_bar_log = torch.log(1 - alphas_prod)
+    one_minus_alphas_bar_sqrt = torch.sqrt(1 - alphas_prod)
+
+    noise = torch.randn_like(x_0)
+    alphas_t = alphas_bar_sqrt[t]
+    alphas_1_m_t = one_minus_alphas_bar_sqrt[t]
+
+    return (alphas_t * x_0 + alphas_1_m_t * noise)
+
+
+class MLPDiffusion(nn.Module):
+
+    def __init__(self, n_steps, max_len, num_units=128):
+        super(MLPDiffusion, self).__init__()
+        self.linears = nn.ModuleList(
+            [
+                nn.Linear(max_len, num_units),
+                nn.ReLU(),
+                nn.Linear(num_units, num_units),
+                nn.ReLU(),
+                nn.Linear(num_units, num_units),
+                nn.ReLU(),
+                nn.Linear(num_units, max_len),
+            ]
+        )
+        self.step_embeddings = nn.ModuleList(
+            [
+                nn.Embedding(n_steps, num_units),
+                nn.Embedding(n_steps, num_units),
+                nn.Embedding(n_steps, num_units),
+            ]
+        )
+
+    def forward(self, x_0, t):
+        x = x_0
+        for idx, embedding_layer in enumerate(self.step_embeddings):
+            t_embedding = embedding_layer(t)
+            x = self.linears[2 * idx](x)
+            x += t_embedding
+            x = self.linears[2 * idx + 1](x)
+
+        x = self.linears[-1](x)
+
+        return x
+
+
+def diffusion_loss_fn(model, x_0, alphas_bar_sqrt, one_minus_alphas_bar_sqrt, n_steps):
+    batch_size = x_0.shape[0]
+
+    t = torch.randint(0, n_steps, size=(batch_size,))
+    t = torch.cat([t, n_steps - 1 - t], dim=0)  # [batchsize]
+    t = t.unsqueeze(-1)  # [batchsize, 1]
+    a = alphas_bar_sqrt[t]
+    am1 = one_minus_alphas_bar_sqrt[t]
+    e = torch.randn_like(x_0)
+    x = x_0 * a + e * am1
+    output = model(x, t.squeeze(-1))
+    return (e - output).square().mean()
+
+
+def p_sample_loop(model, shape, n_steps, betas, one_minus_alphas_bar_sqrt):
+    cur_x = torch.randn(shape)
+    x_seq = [cur_x]
+    for i in reversed(range(n_steps)):
+        cur_x = p_sample(model, cur_x, i, betas, one_minus_alphas_bar_sqrt)
+        x_seq.append(cur_x)
+    return x_seq
+
+
+def p_sample(model, x, t, betas, one_minus_alphas_bar_sqrt):
+    t = torch.tensor([t])
+
+    coeff = betas[t] / one_minus_alphas_bar_sqrt[t]
+
+    eps_theta = model(x, t)
+
+    mean = (1 / (1 - betas[t]).sqrt()) * (x - (coeff * eps_theta))
+
+    z = torch.randn_like(x)
+    sigma_t = betas[t].sqrt()
+
+    sample = mean + sigma_t * z
+
+    return (sample)
+
+
+model = torch.load('Diffusion_mix.pt', weights_only=False)
+
+def generate_mix(model, generated_num, max_len, num_step, betas, one_minus_alphas_bar_sqrt):
+    x_seq = p_sample_loop(model, [generated_num, max_len], num_steps, betas, one_minus_alphas_bar_sqrt)
+    return x_seq[-1]
+
+def traslate_generate(result, vocab, inv_vocab):
+    created=[]
+    for n in result:
+        created_string=[]
+        for i in n:
+            count = 0
+            #print(i.item())
+            if round(i.item()) > len(vocab):
+                count = 1
+                break
+            elif len(vocab) >= round(i.item()) > 0:
+                created_string.append(inv_vocab[round(i.item())])
+        if count <= 0:
+            created.append(created_string)
+    return created
+
+
+def ruled_mixture(created):
+    mixture_beads = []
+    num = 0
+    for i in created:
+        count8 = 0
+        count9 = 0
+        negative_ion = 0
+        count_organ = 0
+        inorgan_group = []
+        MOF_group = []
+        organ_group = []
+        port = 2
+        output = 1
+        charge = 0
+        for j in i:
+            count = int(j[0])
+            charge += int(j[1])
+            charge -= int(j[2])
+            if count == 8:
+                negative_charge = int(j[2])
+                if negative_charge == 0:
+                    count8 += 1
+                elif negative_charge > 0:
+                    negative_ion += 1
+                inorgan_group.append(j)
+                # inorgan_group.append('200000')
+            elif count == 9:
+                count9 += 1
+                MOF_group.append(j)
+                # MOF_group.append('200000')
+            else:
+                count_organ += 1
+                # print(count_organ)
+                organ_group.append(j)
+        if count8 == count9 == count_organ == 0:
+            print('all0')
+            print(organ_group)
+            print(i)
+            break
+        if count_organ != 0:
+            if count_organ != len(organ_group):
+                print(organ_group)
+            new_organ_group = []
+            output = 0
+            new = 1
+            num_g = 0
+            for g in organ_group:
+                new_organ_group.append(g)
+                num_g += 1
+                count = int(g[0])
+                port += (count - 2)
+                if new == 1:
+                    new = 0
+                    if count != 1:
+                        output = 10
+                if port == 0:
+
+                    port = 2
+                    new_organ_group.append('200000')
+                    count_organ += 1
+                    new = 1
+                    if num_g >= len(organ_group) and output == 0:
+                        output = 1
+        if output == 1 and charge == 0 and \
+                ((count8 != 0 and count9 == 0 and count_organ == 0) or (count8 == 0 and count9 != 0 and count_organ == 0) or (count8 == 0 and count9 == 0 and count_organ != 0)):
+            num += 1
+            if count_organ != 0:
+                permited = 0
+                if int(organ_group[0][0]) == 1:
+                    for dot in range(len(new_organ_group) - 1):
+                        if new_organ_group[dot] == '200000' and int(new_organ_group[dot + 1][0]) == 1 and permited == 0:
+                            permited = 1
+                        elif new_organ_group[dot] == '200000' and int(new_organ_group[dot + 1][0]) != 1:
+                            permited = 2
+                    if permited == 0:
+                        permited = 1
+                    if permited == 1:
+                        mixture_beads.append(
+                            [new_organ_group + inorgan_group + MOF_group, count_organ, negative_ion, count9])
+            else:
+                mixture_beads.append([inorgan_group + MOF_group, count_organ, count8, count9])
+    return mixture_beads
+
+
+def stringsplit(instring):
+    return [part for part in instring.split('[*]') if part]
+
+def ring_num_change(instring, ringnum):
+    rn=[]
+    rn_dic={}
+    for s in instring:
+        try:
+            num = int(s)
+            if num not in rn:
+                rn.append(num)
+                if ringnum < 10:
+                    rn_dic[str(num)] = str(ringnum)
+                elif ringnum >=10:
+                    rn_dic[str(num)] = '%' + str(ringnum)
+                ringnum += 1
+        except:
+            pass
+    outstring = ''.join(rn_dic.get(c, c) for c in instring)
+    return outstring, ringnum
+
+def add1(generatelist, addstring, count, addcode, ringnum, head):
+    newaddstring, ringnum = ring_num_change(addstring, ringnum)
+    addlist = stringsplit(newaddstring)
+    
+    for i in addlist:
+        generatelist.insert(count, i)
+        #print(generatelist)
+        count += 1
+        #print(count)
+    if head == 0:
+        count += 2-int(addcode[0])
+    else:
+        count += 0
+
+    return generatelist, count, ringnum
+
+def addall_organic(allbead, bead_DF):
+    generatelist = []
+    ringnum = 1
+    count = 0
+    formerbead = '0'
+    for bead in allbead:
+
+        if formerbead == '0' or formerbead == '200000':
+            addstring = bead_DF.loc[bead_DF['code']==bead, 'HEAD_SMILES'].values[0]
+            HEAD=1
+        else:
+            addstring = bead_DF.loc[bead_DF['code']==bead, 'SMILES'].values[0]
+            HEAD=0
+        formerbead = bead
+        if bead != '200000':
+            generatelist, count, ringnum = add1(generatelist, addstring, count, bead, ringnum, HEAD)
+        else:
+            generatelist.append('.')
+    return generatelist, ringnum
+
+def mix_to_SMILES(mixture_beads, BEAD_SMILES):
+    generate_SMILES = []
+    for poly in mixture_beads:
+        single_SMILES = ''
+        gene,ringnum = addall_organic(poly[0][:poly[1]-1], BEAD_SMILES)
+        if poly[1]==0 and( poly[2]!=0 or poly[3] !=0) :
+            inorgan_head=0
+            for inorgan in poly[0][poly[1]:]:
+                if inorgan_head>0:
+                    gene.append('.')
+                else:
+                    inorgan_head+=1
+                gene.append(BEAD_SMILES.loc[BEAD_SMILES['code']==inorgan, 'SMILES'].values[0])
+        for i in gene:
+            single_SMILES += i
+        generate_SMILES.append(single_SMILES)
+    return generate_SMILES
+
+def generate_mixture(model=model, generated_num=1000, max_len=max_len, num_step=num_steps,
+                    betas=betas, one_minus_alphas_bar_sqrt=one_minus_alphas_bar_sqrt,
+                   vocab=vocab, inv_vocab=inv_vocab, BEAD_SMILES=BEAD_SMILES):
+    generate_result = generate_mix(model, generated_num, max_len, num_step, betas, one_minus_alphas_bar_sqrt)
+    created = traslate_generate(generate_result, vocab, inv_vocab)
+    mixture = ruled_mixture(created)
+    new_mix = mix_to_SMILES(mixture, BEAD_SMILES)
+    return new_mix, mixture
+
+def proton_prediction(saved_model,generate_selected,columns):
+    #saved_model = joblib.load(joblib_model)
+    feature_scaler = saved_model["feature_scaler"]
+    target_scaler = saved_model["target_scaler"]
+    RF = saved_model["model"]
+    generate_X = feature_scaler.transform(generate_selected)
+    generate_X = pd.DataFrame(generate_X, columns=columns)
+    #predict
+    generate_proton_scaled = RF.predict(generate_X)
+    generate_proton = target_scaler.inverse_transform(generate_proton_scaled.reshape(-1,1))
+    #print(generate_proton_scaled.reshape(-1,1))
+    return generate_proton
+
+
+def evaluate_particle(particle, rf_model, fixed_m, columns, general_columns, select_B_col, select_mix_col):
+    try:
+        features = np.concatenate([particle, fixed_m])
+        features_df = pd.DataFrame(features.reshape(1, -1),
+                                   columns=(general_columns + select_B_col + select_mix_col))
+
+        y_pred = proton_prediction(rf_model, features_df, columns)[0][0]
+        return y_pred
+    except Exception as e:
+        print(f"bead asses error: {str(e)}")
+        return -np.inf  
+
+
+def integer_pso(rf_model, fixed_m, e_bounds, num_particles=30, max_iter=50,
+                         columns=['D', 'PA', 'MX', 'T', 'VSAE3', 'VSAE2', 'EVSA8',
+                                  'MESI', 'BJ', 'para_H', 'NH1', 'bicyc', 'NACC', 'CSP3', 'MO', 'VSAE6'],
+                         select_B_col=['VSA_EState3', 'VSA_EState2', 'EState_VSA8',  
+                                       'MinEStateIndex', 'BalabanJ', 'fr_para_hydroxylation'],  
+                         select_mix_col=['fr_NH1', 'fr_bicyclic', 'NumAromaticCarbocycles',  
+                                         'FractionCSP3', 'fr_methoxy', 'VSA_EState6'],  
+                         general_columns=['thickness', 'PA uptake', 'mix uptake', 'temperature'],
+                         n_workers=None):
+    dim = len(e_bounds)
+
+    particles = np.zeros((num_particles, dim), dtype=int)
+    velocities = np.zeros((num_particles, dim))
+    for i in range(num_particles):
+        for j in range(dim):
+            low, high = e_bounds[j]
+            particles[i, j] = np.random.randint(low, high + 1)
+
+
+    pbest = particles.copy()
+    pbest_scores = np.full(num_particles, -np.inf)
+
+    gbest = particles[0].copy()
+    gbest_score = -np.inf
+
+    w = 0.6  # weight
+    c1, c2 = 0.8, 0.8  
+
+    if n_workers is None:
+        n_workers = multiprocessing.cpu_count()
+
+    evaluate_func = partial(
+        evaluate_particle,
+        rf_model=rf_model,
+        fixed_m=fixed_m,
+        columns=columns,
+        general_columns=general_columns,
+        select_B_col=select_B_col,
+        select_mix_col=select_mix_col
+    )
+
+    history = []
+
+    with multiprocessing.Pool(processes=n_workers) as pool:
+        for iter in tqdm(range(max_iter), desc="PSO process"):
+            y_preds = pool.map(evaluate_func, particles)
+            for i in range(num_particles):
+                y_pred = y_preds[i]
+                if y_pred > pbest_scores[i]:
+                    pbest_scores[i] = y_pred
+                    pbest[i] = particles[i].copy()
+
+                if y_pred > gbest_score:
+                    gbest_score = y_pred
+                    gbest = particles[i].copy()
+
+            history.append(gbest_score)
+            for i in range(num_particles):
+                for d in range(dim):
+                    r1, r2 = np.random.random(), np.random.random()
+                    velocities[i, d] = (w * velocities[i, d] +
+                                        c1 * r1 * (pbest[i, d] - particles[i, d]) +
+                                        c2 * r2 * (gbest[d] - particles[i, d]))
+
+                    new_pos = particles[i, d] + velocities[i, d]
+
+                    low, high = e_bounds[d]
+                    particles[i, d] = np.clip(int(round(new_pos)), low, high)
+
+    return gbest, gbest_score
+
+
+def needed_output(thick, PAU, T, MX, proton, joblib_model, target=50,
+                  columns=['D', 'PA', 'MX', 'T', 'VSAE3', 'VSAE2', 'EVSA8',
+                           'MESI', 'BJ', 'para_H', 'NH1', 'bicyc', 'NACC', 'CSP3', 'MO', 'VSAE6'],
+                  select_B_col=['VSA_EState3', 'VSA_EState2', 'EState_VSA8',  
+                                'MinEStateIndex', 'BalabanJ', 'fr_para_hydroxylation'], 
+                  select_mix_col=['fr_NH1', 'fr_bicyclic', 'NumAromaticCarbocycles',  
+                                  'FractionCSP3', 'fr_methoxy', 'VSA_EState6'],  
+                  membrane_base=['[*]C1=NC2=C(N1)C=CC(=C2)C3=CC=C4C(=C3)N=C(N4)C5=CC=C(C=C5)OC6=CC=C(C=C6)[*]']
+                  ):
+    needed_SMILES = []
+    needed_proton = []
+    needed_BEADS = []
+    count = 0
+    cycle = 0
+    saved_model = joblib.load(joblib_model)
+
+    while count < target:
+        mix_SMILES, mix_BEADS = generate_mixture()
+        Mol_descriptors_create, desc_names = RDkit_descriptors(mix_SMILES)
+        print('Generated'+str(len(mix_SMILES)))
+
+        Mol_descriptors_create_PBI, desc_names_PBI = RDkit_descriptors(membrane_base)
+        generate_B_SMILES_DF = pd.DataFrame(Mol_descriptors_create_PBI, columns=desc_names)
+        generate_B_SMILES_select = generate_B_SMILES_DF[select_B_col]
+       
+        generate_MIX_SMILES_DF = pd.DataFrame(Mol_descriptors_create, columns=desc_names)
+        generate_MIX_SMILES_select = generate_MIX_SMILES_DF[select_mix_col]
+
+        print('Start PSO')
+        for generate_MIX_SMILES_num in range(len(generate_MIX_SMILES_select.values)):
+            changed_e = [thick, PAU, MX, T]
+            fixed_m = list(generate_B_SMILES_select.values[0]) + list(
+                generate_MIX_SMILES_select.values[generate_MIX_SMILES_num])
+
+            ex_best, proton_best = integer_pso(saved_model, fixed_m, changed_e, columns=columns,
+                                               select_B_col=select_B_col, select_mix_col=select_mix_col)
+
+            if proton_best >= proton:
+                count += 1
+                needed_SMILES.append(mix_SMILES[generate_MIX_SMILES_num])
+                needed_BEADS.append(mix_BEADS[generate_MIX_SMILES_num])
+                needed_proton.append([proton_best, ex_best])
+
+        cycle += 1
+        #print(cycle)
+
+    return needed_SMILES, needed_proton, needed_BEADS
+
+needed_SMILES,needed_proton,needed_BEADS = needed_output(thick=(40,100), PAU=(100,300), MX=(10,50), T=(373,473), proton=0, joblib_model="RF_mix_normal.joblib", target=1)
+
+column_names = [
+    "SMILES", 
+    "BEADS",  
+    "ORGAN",  
+    "INORGAN",  
+    "MOF",  
+    "Proton Conductivity",  
+    "Thickness", 
+    "PA Uptake", 
+    "Mix Uptatke", 
+    "Temperature"  
+]
+
+
+data = []
+for a, c, b in zip(needed_SMILES, needed_BEADS, needed_proton):
+    c_list_str = ', '.join(map(str, c[0]))
+
+    
+    row = [
+        a,  
+        c_list_str,  
+        c[1], c[2], c[3],  
+        b[0],  
+        *b[1]  
+    ]
+    data.append(row)
+
+
+df = pd.DataFrame(data, columns=column_names)
+df.to_excel("saved_excel.xlsx", index=False)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
