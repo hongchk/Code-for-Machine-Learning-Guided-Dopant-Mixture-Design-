@@ -1,1 +1,131 @@
+import pandas as pd
+import math
+import numpy as np
+import sklearn
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.model_selection import train_test_split
+from sklearn import linear_model
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from scipy.stats import pearsonr
+from sklearn.model_selection import cross_val_score
+from sklearn.preprocessing import OneHotEncoder
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from rdkit.Chem import Draw
+from rdkit.Chem import ChemicalFeatures
+from rdkit import RDConfig
+import os
+from rdkit.ML.Descriptors import MoleculeDescriptors
+from rdkit.Chem import Descriptors
+import shap
+from sklearn.metrics import mean_squared_error as mse
+import time
+import joblib
+
+def RDkit_descriptors(smiles):
+    mols = [Chem.MolFromSmiles(i) for i in smiles]
+    print(smiles)
+    calc = MoleculeDescriptors.MolecularDescriptorCalculator([x[0] for x in Descriptors._descList])
+    desc_names = calc.GetDescriptorNames()
+    n=0
+    Mol_descriptors = []
+    for mol in mols:
+        # add hydrogens to molecules
+        n+=1
+        try:
+            mol = Chem.AddHs(mol)
+        except:
+            print(n)
+            exit()
+        # Calculate all 200 descriptors for each molecule
+        descriptors = calc.CalcDescriptors(mol)
+        Mol_descriptors.append(descriptors)
+    return Mol_descriptors, desc_names
+
+excel = pd.read_excel(io=r'database.xlsx')
+need_1 = excel.to_dict('list')
+proton_con = need_1['proton conductivity']
+excel_change = excel.drop('proton conductivity', axis=1)
+excel_change_nonstring = excel.drop(['base', 'membrane method', 'PA method', 'mix', 'mix method',
+                                     'B_SMILES', 'mix_SMILES'], axis=1)
+excel_change_string = excel.drop(['base', 'thickness', 'PA uptake', 'temperature', 'proton conductivity',
+                                  'B_SMILES', 'mix_SMILES', 'mix', 'mix uptake'], axis=1)
+enc = OneHotEncoder()
+# print(excel_change_string)
+enc.fit(excel_change_string)
+excel_change_string = enc.transform(excel_change_string).toarray()
+
+excel_B_SMILES = pd.read_excel(io=r'database.xlsx', usecols=['B_SMILES'])
+excel_mix_SMILES = pd.read_excel(io=r'database.xlsx', usecols=['mix_SMILES'])
+list_B_SMILES = excel_B_SMILES.to_dict('list')['B_SMILES']
+list_mix_SMILES = excel_mix_SMILES.to_dict('list')['mix_SMILES']
+Mol_descriptors, desc_names = RDkit_descriptors(list_B_SMILES)
+Mol_mix_descriptors, desc_mix_names = RDkit_descriptors(list_mix_SMILES)
+B_SMILES_DF = pd.DataFrame(Mol_descriptors, columns=desc_names)
+mix_SMILES_DF = pd.DataFrame(Mol_mix_descriptors, columns=desc_mix_names)
+
+select_B_col = ['VSA_EState3', 'VSA_EState2', 'EState_VSA8', 'MinEStateIndex', 'BalabanJ', 'fr_para_hydroxylation'] 
+B_SMILES_select = B_SMILES_DF[select_B_col]
+excel_change_corr = pd.concat([mix_SMILES_DF, excel_change_nonstring], axis=1)
+
+select_mix_col = ['fr_NH1', 'fr_bicyclic', 'NumAromaticCarbocycles', 'FractionCSP3', 'fr_methoxy', 'VSA_EState6']
+mix_SMILES_select = mix_SMILES_DF[select_mix_col]
+excel_change_corr = pd.concat([pd.DataFrame(excel_change_string), B_SMILES_select, mix_SMILES_select, excel_change_nonstring], axis=1)
+excel_change = pd.concat([excel_change_nonstring, B_SMILES_select, mix_SMILES_select], axis=1)
+excel_change.columns = excel_change.columns.astype(str)
+NANclo = []
+excel_change = excel_change.dropna(how='any', axis=1)
+excel_change.columns = excel_change.columns.astype(str)
+
+dataextreme = {}
+for i in excel_change.columns:
+    dataextreme[i] = [np.max(excel_change[i]),np.min(excel_change[i])]
+excel_change = excel_change.drop(['proton conductivity'], axis=1)
+
+normalizationX = MinMaxScaler()
+excel_change_n = normalizationX.fit_transform(excel_change)
+proton_con_log = []
+for i in proton_con:
+    proton_con_log.append([i])
+normalizationY = MinMaxScaler()
+proton_con = normalizationY.fit_transform(proton_con_log)
+proton_con = np.array(proton_con)
+proton_con = proton_con.reshape(-1, )
+pd.DataFrame(excel_change_n)
+
+columns = ['D','PA','MX','T','VSAE3','VSAE2','EVSA8','MESI','BJ','para_H', 'NH1', 'bicyc', 'NACC','CSP3','MO','VSAE6']
+excel_change_n = pd.DataFrame(excel_change_n, columns=columns)
+excel_change_n.to_excel('excel_change.xlsx')
+
+trainX, testX, trainY, testY = train_test_split(excel_change_n, proton_con.ravel(), test_size=0.25, random_state=88881)
+
+# 模型的训练
+RF = RandomForestRegressor(random_state=888, n_estimators=2000)
+CLF = DecisionTreeRegressor(random_state=888)
+LTRF = RandomForestRegressor(random_state=888, n_estimators=100)
+RF = RF.fit(trainX, trainY)
+CLF = CLF.fit(trainX, trainY)
+clf_s = CLF.score(testX, testY)
+rf_s = RF.score(testX, testY)
+
+joblib.dump(
+    {
+        "feature_scaler": normalizationX,
+        "target_scaler": normalizationY,
+        "model": RF
+    },
+    "RF_mix_normal.joblib"
+)
+
+LTRF = LTRF.fit(trainX, trainY)
+ltrf_s = LTRF.score(testX, testY)
+LR = linear_model.LinearRegression()
+LR.fit(trainX, trainY)
+pre_y = LR.predict(testX)
+lr_s = LR.score(testX, testY)
+
+
+
 
